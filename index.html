@@ -175,6 +175,7 @@ footer{text-align:center;color:var(--muted);font-size:12px;margin-top:30px}
   .grid2,.grid3,.facts{grid-template-columns:1fr}
   .head h1{font-size:25px}
 }
+.more-row{grid-column:1/-1;display:flex;gap:12px;align-items:center;justify-content:center;padding:16px;color:var(--muted)}
 </style>
 </head>
 <body>
@@ -242,6 +243,28 @@ async function api(method,path,body,prefer){
   if(r.status===204) return null;
   return r.json().catch(function(){return null;});
 }
+/* Supabase sends at most 1000 rows per request, so load in pages (5 at a time).
+   MAX_LEADS = how many of the newest leads the CRM loads (1 lakh). */
+var MAX_LEADS=100000, SHOW_STEP=200;
+async function apiAll(path,max,onProgress){
+  max=max||MAX_LEADS; var sep=path.indexOf("?")>=0?"&":"?", seen={}, all=[];
+  function add(rows){ (rows||[]).forEach(function(r){ var k=r&&r.id!=null?String(r.id):JSON.stringify(r); if(!seen[k]){ seen[k]=1; all.push(r); } }); }
+  function get(off,lim){ return api("GET",path+sep+"limit="+lim+"&offset="+off); }
+  var first=await get(0,Math.min(1000,max)); first=first||[]; add(first);
+  if(!first.length || all.length>=max) return all.slice(0,max);
+  var ps=first.length, off=ps;            /* page size the server actually allows */
+  while(all.length<max){
+    var reqs=[];
+    for(var k=0;k<5 && off+k*ps<max;k++) reqs.push(get(off+k*ps,ps));
+    if(!reqs.length) break;
+    var pages=await Promise.all(reqs), done=false;
+    for(var i=0;i<pages.length;i++){ var rows=pages[i]||[]; add(rows); if(rows.length<ps){ done=true; break; } }
+    off+=reqs.length*ps;
+    if(onProgress) onProgress(all.length);
+    if(done) break;
+  }
+  return all.slice(0,max);
+}
 async function findMember(tok,email){
   var r=await fetch(C.url+"/rest/v1/team_members?select=name,role&auth_email=eq."+encodeURIComponent(email.toLowerCase()),{headers:{apikey:C.anonKey,Authorization:"Bearer "+tok,Accept:"application/json"}});
   var rows=r.ok?await r.json():[]; if(!rows.length) throw new Error("This email is not on the team list. Add it to team_members in Supabase."); return rows[0];
@@ -249,7 +272,7 @@ async function findMember(tok,email){
 
 /* ---------------- state ---------------- */
 var S={ user:null, view:"Dashboard", leads:[], policies:[], claims:[], team:[], conn:"checking", connMsg:"",
-  q:"", f:{stage:"All",priority:"All",city:"All",assigned:"All",source:"All"}, open:null, modal:null, busy:false, loginErr:"", claimsMissing:false };
+  q:"", f:{stage:"All",priority:"All",city:"All",assigned:"All",source:"All"}, open:null, modal:null, busy:false, loginErr:"", claimsMissing:false, showN:SHOW_STEP };
 var VIEWS=["Dashboard","Today's Calls","All Leads","Pipeline","Renewals","Policies","Claims","Team","Settings"];
 
 function teamNames(){ var n=S.team.map(function(t){return t.name;}).filter(Boolean); if(!n.length) n=["Prateek","Team"]; return n; }
@@ -260,13 +283,13 @@ async function loadAll(){
   S.conn="checking"; render();
   try{
     var res=await Promise.all([
-      api("GET","leads?select=*&order=created_at.desc"),
-      api("GET","policies?select=*&order=created_at.desc").catch(function(){return [];}),
-      api("GET","claims?select=*&order=created_at.desc").catch(function(e){ S.claimsMissing=/does not exist|404|PGRST205/.test(e.message); return []; }),
+      apiAll("leads?select=*&order=created_at.desc,id.desc",MAX_LEADS,function(n){ S.loadedSoFar=n; var b=document.querySelector(".conn"); if(b) b.lastChild.textContent="Loading "+n.toLocaleString("en-IN")+" leads…"; }),
+      apiAll("policies?select=*&order=created_at.desc,id.desc").catch(function(){return [];}),
+      apiAll("claims?select=*&order=created_at.desc,id.desc").catch(function(e){ S.claimsMissing=/does not exist|404|PGRST205/.test(e.message); return []; }),
       api("GET","team_members?select=name,role,city,auth_email&order=id").catch(function(){return [];})
     ]);
     S.leads=res[0]||[]; S.policies=res[1]||[]; S.claims=res[2]||[]; S.team=res[3]||[];
-    S.conn="ok"; S.connMsg="Connected — "+S.leads.length+" lead(s)";
+    S.conn="ok"; S.leadsCapped=S.leads.length>=MAX_LEADS; S.connMsg="Connected — "+S.leads.length.toLocaleString("en-IN")+" lead(s)"+(S.leadsCapped?" (newest "+MAX_LEADS.toLocaleString("en-IN")+" loaded)":"");
   }catch(e){ S.conn="bad"; S.connMsg=e.message; toast("Could not load from Supabase",true); }
   render();
 }
@@ -394,8 +417,12 @@ function leadCard(l){
 function callsView(){
   var due=dueLeads(), t=today();
   return '<div class="head"><div><h1>Today\'s calls</h1><p>Overdue first, then Hot leads. Log every call so nothing is missed.</p></div></div>'+
-    (due.length?'<div class="lead-grid">'+due.map(leadCard).join("")+'</div>':'<div class="empty">All caught up for today 🎉</div>')+
-    (S.leads.filter(calledToday).length?'<h3 class="serif" style="margin:22px 0 10px">Already called today</h3><div class="lead-grid">'+S.leads.filter(calledToday).filter(function(l){return due.indexOf(l)<0;}).map(leadCard).join("")+'</div>':"");
+    (due.length?'<div class="lead-grid">'+capped(due,leadCard)+'</div>':'<div class="empty">All caught up for today 🎉</div>')+
+    (S.leads.filter(calledToday).length?'<h3 class="serif" style="margin:22px 0 10px">Already called today</h3><div class="lead-grid">'+S.leads.filter(calledToday).filter(function(l){return due.indexOf(l)<0;}).slice(0,SHOW_STEP).map(leadCard).join("")+'</div>':"");
+}
+function capped(list,fn){
+  var shown=list.slice(0,S.showN).map(fn).join(""), more=list.length-S.showN;
+  return shown+(more>0?'<div class="more-row">Showing '+S.showN.toLocaleString("en-IN")+' of '+list.length.toLocaleString("en-IN")+' <button class="btn" data-act="more">Show '+Math.min(SHOW_STEP,more)+' more</button></div>':"");
 }
 function leadsView(){
   var list=filtered(), f=S.f;
@@ -409,18 +436,19 @@ function leadsView(){
       '<select data-filter="assigned">'+opt(["All"].concat(teamNames()),f.assigned)+'</select>'+
       '<select data-filter="source">'+opt(["All"].concat(sources),f.source)+'</select>'+
       '<button class="btn ghost" data-act="clear-filters">Clear</button></div>'+
-    (list.length?'<div class="lead-grid">'+list.map(leadCard).join("")+'</div>':'<div class="empty">No leads match.</div>');
+    (S.leadsCapped?'<div class="error" style="margin-bottom:12px">You have more than '+MAX_LEADS.toLocaleString("en-IN")+' leads. Only the newest '+MAX_LEADS.toLocaleString("en-IN")+' are loaded here. Older ones are safe in Supabase.</div>':"")+
+    (list.length?'<div class="lead-grid">'+capped(list,leadCard)+'</div>':'<div class="empty">No leads match.</div>');
 }
 function pipeView(){
   return '<div class="head"><div><h1>Pipeline</h1><p>Move leads forward as you talk to them.</p></div></div><div class="kanban">'+
     STAGES.map(function(s,i){ var ls=S.leads.filter(function(l){return stageOf(l)===s;});
       return '<div class="col"><div class="col-h"><b>'+esc(s)+'</b><span class="tag">'+ls.length+'</span></div>'+
-        (ls.length?ls.map(function(l){ return '<div class="kcard"><b data-act="open" data-id="'+l.id+'">'+esc(l.name)+'</b> <span class="tag '+esc(l.priority||"Warm")+'">'+esc(l.priority||"Warm")+'</span><p>'+esc(l.phone)+' • '+dash(l.city)+'</p><p>Next: '+fmtDate(l.next_followup)+'</p>'+
+        (ls.length?ls.slice(0,50).map(function(l){ return '<div class="kcard"><b data-act="open" data-id="'+l.id+'">'+esc(l.name)+'</b> <span class="tag '+esc(l.priority||"Warm")+'">'+esc(l.priority||"Warm")+'</span><p>'+esc(l.phone)+' • '+dash(l.city)+'</p><p>Next: '+fmtDate(l.next_followup)+'</p>'+
           '<div class="k-acts">'+(i>0&&i<6?'<button class="btn sm" data-act="move" data-id="'+l.id+'" data-to="'+esc(STAGES[i-1])+'">←</button>':"")+
           (i<5?'<button class="btn sm primary" style="flex:1" data-act="move" data-id="'+l.id+'" data-to="'+esc(STAGES[i+1])+'">'+esc(STAGES[i+1])+' →</button>':"")+
           (i===5?'<button class="btn sm primary" style="flex:1" data-act="sold" data-id="'+l.id+'">Policy sold</button>':"")+
           (i>=6?'<button class="btn sm" style="flex:1" data-act="move" data-id="'+l.id+'" data-to="Follow-up">Reopen</button>':"")+
-          '</div></div>'; }).join(""):'<div class="empty" style="padding:16px;font-size:12px">Empty</div>')+'</div>'; }).join("")+'</div>';
+          '</div></div>'; }).join("")+(ls.length>50?'<div class="empty" style="padding:12px;font-size:12px">+'+(ls.length-50).toLocaleString("en-IN")+' more. Use All Leads → stage filter.</div>':""):'<div class="empty" style="padding:16px;font-size:12px">Empty</div>')+'</div>'; }).join("")+'</div>';
 }
 function renewView(){
   var pr=policyRenewals(), ld=prospectRenewals();
@@ -430,7 +458,7 @@ function renewView(){
     pr.map(function(p){ var l=leadById(p.lead_id)||{}; var d=daysUntil(p.renewal_date); var msg="Namaste "+(p.client||l.name||"")+" ji, aapki "+(p.company||"health")+" policy "+fmtPlain(p.renewal_date)+" ko renew honi hai. Koi bhi sawaal ho toh bataiye. — TriCity Health Wala";
       return '<tr><td><b style="color:var(--ink)">'+dash(p.client)+'</b><br><small class="muted">'+dash(p.policy_no)+'</small></td><td>'+dash(p.company)+'<br><small class="muted">'+dash(p.plan_name)+'</small></td><td>'+money(p.sum_insured)+'</td><td>'+money(p.premium)+'</td><td>'+fmtDate(p.renewal_date)+'<br>'+dTag(d)+'</td><td>'+(l.phone?'<a class="btn sm wa" target="_blank" rel="noopener" href="'+esc(waLink(l.whatsapp||l.phone,msg))+'">Remind</a>':"")+'</td></tr>'; }).join("")+'</table></div>':'<div class="empty" style="margin-top:10px">No policy renewals in the next 60 days.</div>')+'</div>'+
   '<div class="panel" style="margin-top:14px"><h3>Prospects whose current policy renews soon</h3><p class="muted" style="margin:4px 0 0;font-size:12px">Best time to review their cover. Porting keeps waiting-period credit — check the new insurer\'s rules.</p>'+
-    (ld.length?ld.map(function(l){ return leadRow(l,dTag(daysUntil(l.existing_renewal_date))+' '+dash(l.existing_insurer)); }).join(""):'<div class="empty" style="margin-top:10px">None yet.</div>')+'</div>';
+    (ld.length?capped(ld,function(l){ return leadRow(l,dTag(daysUntil(l.existing_renewal_date))+' '+dash(l.existing_insurer)); }):'<div class="empty" style="margin-top:10px">None yet.</div>')+'</div>';
 }
 function fmtPlain(ds){ if(!ds) return ""; var d=new Date(String(ds).slice(0,10)+"T00:00:00"); return d.toLocaleDateString("en-IN",{day:"numeric",month:"short"}); }
 function policiesView(){
@@ -455,7 +483,7 @@ function settingsView(){
     '<p class="muted">Project</p><p style="word-break:break-all">'+esc(C.url)+'</p><p class="muted">Status</p><p>'+esc(S.connMsg||"—")+'</p>'+
     '<button class="btn primary" data-act="reload">Refresh data</button> <button class="btn ghost" data-act="export">Export leads CSV</button>'+
     '<h3 style="margin-top:20px">Track which reel brings leads</h3><p class="muted">Use your landing link with a reel code in each caption / bio, e.g.<br><b style="color:var(--ink)">yoursite.vercel.app/?reel=05</b><br>The code is saved on the lead and shown on the Dashboard.</p></div>'+
-    '<div class="panel"><h3>Add a team member</h3><ol style="line-height:1.8;padding-left:18px"><li>Supabase → Authentication → Users → <b>Add user</b> (tick Auto Confirm).</li><li>SQL Editor → run:<br><code style="font-size:12px;word-break:break-all">insert into team_members (name, role, city, auth_email) values (\'Rahul\',\'Team Member\',\'Mohali\',\'rahul@email.com\');</code></li><li>They can now log in here.</li></ol>'+
+    '<div class="panel"><h3>Add a team member</h3><ol style="line-height:1.8;padding-left:18px"><li>Supabase → Authentication → Users → <b>Add user</b> (tick Auto Confirm).</li><li>SQL Editor → run:<br><code style="display:block;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;padding:8px 10px;margin-top:6px;background:rgba(255,255,255,.06);border-radius:8px">insert into team_members (name, role, city, auth_email) values (\'Rahul\',\'Team Member\',\'Mohali\',\'rahul@email.com\');</code></li><li>They can now log in here.</li></ol>'+
     '<h3 style="margin-top:20px">Deleting a lead</h3><p class="muted">For safety the CRM cannot delete. If a customer asks you to remove their data, delete the row in Supabase → Table Editor → leads.</p></div></div>';
 }
 
@@ -700,7 +728,7 @@ document.addEventListener("click",function(e){
   if(el.tagName==="A") return;
   e.preventDefault();
   switch(act){
-    case "view": S.view=el.getAttribute("data-v"); S.q=""; document.getElementById("side")&&document.getElementById("side").classList.remove("open"); render(); window.scrollTo(0,0); break;
+    case "view": S.view=el.getAttribute("data-v"); S.q=""; S.showN=SHOW_STEP; document.getElementById("side")&&document.getElementById("side").classList.remove("open"); render(); window.scrollTo(0,0); break;
     case "menu": document.getElementById("side").classList.toggle("open"); break;
     case "logout": var s=session; session=null; clearS(); clearTimeout(timer); S.user=null; S.leads=[]; S.policies=[]; S.claims=[]; S.open=null; S.modal=null; if(s) authPost("logout",{},s.access_token).catch(function(){}); render(); break;
     case "reload": loadAll(); break;
@@ -716,15 +744,16 @@ document.addEventListener("click",function(e){
     case "new-claim": S.modal={type:"claim",lead:el.getAttribute("data-lead")||null}; render(); break;
     case "edit-claim": S.modal={type:"claim",claim:S.claims.find(function(c){return String(c.id)===String(id);})}; render(); break;
     case "move": var l=leadById(id); if(l) patchLead(id,{stage:el.getAttribute("data-to"),notes:prependNote(l,"Stage → "+el.getAttribute("data-to"))},"Moved to "+el.getAttribute("data-to")); break;
-    case "clear-filters": S.f={stage:"All",priority:"All",city:"All",assigned:"All",source:"All"}; S.q=""; render(); break;
+    case "clear-filters": S.f={stage:"All",priority:"All",city:"All",assigned:"All",source:"All"}; S.q=""; S.showN=SHOW_STEP; render(); break;
     case "export": exportCsv(); break;
+    case "more": S.showN+=SHOW_STEP; render(); break;
     case "add-member": var box=document.getElementById("members"); if(box) box.insertAdjacentHTML("beforeend",memberRow({})); break;
     case "del-member": var row=el.closest(".member"); if(row) row.remove(); break;
   }
 });
 document.addEventListener("change",function(e){
   var t=e.target;
-  if(t.matches("[data-filter]")){ S.f[t.getAttribute("data-filter")]=t.value; render(); return; }
+  if(t.matches("[data-filter]")){ S.f[t.getAttribute("data-filter")]=t.value; S.showN=SHOW_STEP; render(); return; }
   if(t.matches("[data-doc]")){
     var id=t.getAttribute("data-id"), l=leadById(id); if(!l) return;
     var docs=Object.assign({},(l.docs&&typeof l.docs==="object")?l.docs:{}); docs[t.getAttribute("data-doc")]=t.checked;
@@ -733,7 +762,7 @@ document.addEventListener("change",function(e){
 });
 var qTimer;
 document.addEventListener("input",function(e){
-  if(e.target.matches("[data-input=q]")){ var v=e.target.value; clearTimeout(qTimer); qTimer=setTimeout(function(){ S.q=v; render(); var i=document.querySelector("[data-input=q]"); if(i){ i.focus(); i.setSelectionRange(v.length,v.length);} },250); }
+  if(e.target.matches("[data-input=q]")){ var v=e.target.value; clearTimeout(qTimer); qTimer=setTimeout(function(){ S.q=v; S.showN=SHOW_STEP; render(); var i=document.querySelector("[data-input=q]"); if(i){ i.focus(); i.setSelectionRange(v.length,v.length);} },250); }
 });
 document.addEventListener("keydown",function(e){ if(e.key==="Escape"){ if(S.modal){S.modal=null;render();} else if(S.open){S.open=null;render();} } });
 
